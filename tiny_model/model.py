@@ -122,42 +122,44 @@ class TinyConditionalUNet(nn.Module):
     def __init__(self, base_ch: int = 64, ch_mults: Tuple[int, ...] = (1, 2, 4),
                  cond_dim: int = 128, palette_len: int = 72):
         super().__init__()
-        emb_dim = cond_dim * 2                                 # time + palette
+        emb_dim = cond_dim                                     # joint embed width
         self.time_mlp = nn.Sequential(
-            nn.Linear(64, emb_dim), nn.SiLU(), nn.Linear(emb_dim, cond_dim))
-        # joint embedding is projected down to cond_dim so every FiLM Linear
-        # sees a fixed width regardless of conditioning depth (VRAM-friendly)
-        self.emb_proj = nn.Linear(emb_dim, cond_dim)
-        self.pal_enc = PaletteEncoder(palette_len, 128, cond_dim)
+            nn.Linear(64, emb_dim), nn.SiLU(), nn.Linear(emb_dim, cond_dim // 2))
+        self.pal_enc = PaletteEncoder(palette_len, 128, cond_dim // 2)
+        # FiLM context = concat(time, palette) at cond_dim total width
+        self.film_dim = emb_dim
 
         chans = [base_ch * m for m in ch_mults]                # [64,128,256]
         self.stem = nn.Conv2d(3, chans[0], 3, padding=1)
 
         # ---- encoder: stem + block at current res are both saved as skips,
-        #      then downsample. skip_chans tracks the tensor widths pushed. ---
-        # Down blocks change channel width (ch -> ch*2); ResBlocks keep width.
-        self.pre_blocks = nn.ModuleList([ResBlock(ch, ch, cond_dim)
+        #      then downsample. Push order (forward):
+        #        [stem64@64, blk64@64, down128@32, blk128@32, down256@16]
+        #      Pop order (LIFO): [256@16, 128@32, 128@32, 64@64, 64@64]
+        self.pre_blocks = nn.ModuleList([ResBlock(ch, ch, emb_dim)
                                          for ch in chans[:-1]])
         self.downs = nn.ModuleList([Down(chans[i], chans[i + 1])
                                     for i in range(len(chans) - 1)])
-        skip_chans = []                                        # pushed per forward
-        c_in = chans[-1]
-        self.mid_film = nn.Linear(cond_dim, c_in * 2)  # extra FiLM at bottleneck
-        self.mid1 = ResBlock(c_in, c_in, cond_dim)
-        self.mid2 = ResBlock(c_in, c_in, cond_dim, attn=True)
+        c_in = chans[-1]                                       # 256 @ 16x16
+        self.mid_film = nn.Linear(emb_dim, c_in * 2)   # extra FiLM at bottleneck
+        self.mid1 = ResBlock(c_in, c_in // 2, emb_dim)         # 256 -> 128
+        self.mid2 = ResBlock(c_in // 2, c_in // 2, emb_dim, attn=True)
+        c_in = c_in // 2                                       # 128 into decoder
 
-        # ---- decoder: upsample, concat matching skip, residual block -----
-        # NOTE: encoder block outputs (skip_chans[1:]) are consumed by the
-        # downsampler, so the matching skips are [ch0, ch1]; the stem output
-        # pairs with the final 64->64 block.
+        # ---- decoder: upsample to the skip's resolution, concat matching
+        #      skip, residual block. Pop order (LIFO):
+        #        [proj256->128 @ 16x16, blk128@32, down128@32, blk64@64, stem64@64]
+        #      so concat widths are 128+128, 128+128, 64+128, 64+64 and the
+        #      c_in evolution is 128 -> 128 -> 64 -> 64 -> 64. Total ~4 M params
+        #      (< 5 M budget, < 10 M hard cap).
+        self.skip_proj_256 = nn.Conv2d(chans[-1], chans[-1] // 2, 1)
         self.up_blocks = nn.ModuleList()
         self.ups = nn.ModuleList()
-        # static push order -> deterministic pop order in forward():
-        #   pushes: [64,64, 128,128, 256]   pops: 256,128,128,64,64
-        up_specs = [(256 + 256, 128), (128 + 128, 64), (64 + 64, 64)]
+        up_specs = [(128 + 128, 128), (128 + 128, 64), (64 + 128, 64),
+                    (64 + 64, 64)]
         for cat_ch, ch in up_specs:
             self.ups.append(Up(c_in))
-            self.up_blocks.append(ResBlock(c_in + cat_ch, ch, cond_dim))
+            self.up_blocks.append(ResBlock(cat_ch, ch, emb_dim))
             c_in = ch
         self.out_norm = nn.GroupNorm(8, chans[0])
         self.out_conv = nn.Conv2d(chans[0], 3, 3, padding=1)
@@ -177,7 +179,7 @@ class TinyConditionalUNet(nn.Module):
                 pal: torch.Tensor) -> torch.Tensor:
         temb = self.time_mlp(sinusoidal_timestep_emb(t, 64))
         pemb = self.pal_enc(pal)
-        emb = self.emb_proj(torch.cat([temb, pemb], dim=-1))
+        emb = torch.cat([temb, pemb], dim=-1)                  # (B, cond_dim)
 
         h = self.stem(x)
         skips = [h]                                            # 64 @ 64x64
@@ -185,11 +187,13 @@ class TinyConditionalUNet(nn.Module):
             h = self._run_block(blk, h, emb)
             skips.append(h)                                    # 64 / 128
             h = dn(h)                                          # -> 128 / 256
-        skips.append(h)                                        # 256 @ 16x16
         m_emb = emb
         scale, shift = self.mid_film(emb).chunk(2, dim=-1)
         h = h * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
-        h = self._run_block(self.mid1, h, m_emb)
+        s_deep = F.interpolate(skips[-1], size=h.shape[-2:], mode="nearest")
+        s_deep = self.skip_proj_256(s_deep)                    # 256@16 -> 128@16
+        skips[-1] = s_deep                                     # replace top skip
+        h = self._run_block(self.mid1, h, m_emb)               # 256 -> 128
         h = self._run_block(self.mid2, h, m_emb)
         for blk, up in zip(self.up_blocks, self.ups):
             h = up(h)
